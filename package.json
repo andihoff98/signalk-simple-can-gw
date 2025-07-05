@@ -1,13 +1,16 @@
 {
-  "name": "@signalk/set-system-time",
+  "name": "signalk-simple-can-gw",
   "version": "1.3.1",
-  "description": "Signal K server plugin to set system date & time on Signal K data, usually from a GPS",
+  "description": "Signal K Node server plugin to relay between a simple CAN protocol",
   "main": "index.js",
   "keywords": [
     "signalk-node-server-plugin"
   ],
-  "author": "teppo.kurki@iki,fi",
+  "author": "andihoff98",
   "license": "Apache-2.0",
+  "dependencies": {
+    "socketcan": "^2.0.1"
+  },
   "devDependencies": {
     "baconjs": "^1.0.1"
   }

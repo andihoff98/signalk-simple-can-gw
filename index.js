@@ -1,113 +1,174 @@
-module.exports = function (app) {
-  const logError =
-    app.error ||
-    (err => {
-      console.error(err)
-    })
-  const debug =
-    app.debug ||
-    (msg => {
-      console.log(msg)
-    })
+const can = require("socketcan");
 
-  var plugin = {
-    unsubscribes: []
-  }
+module.exports = (app) => {
+  let channel;
+  let subList = [];
+  const plugin = {
+    id: 'simple-can-gw',
+    name: 'Simple CAN Gateway',
+    start: (options, restartPlugin) => {
+      app.debug("Starting simple CAN plugin");
 
-  plugin.id = 'set-system-time'
-  plugin.name = 'Set System Time'
-  plugin.description =
-    'Plugin that sets the system date & time from navigation.datetime delta messages'
+      // Create mappings
+      const inputs = (options.inputs || []).map(entry => ({
+        id: parseInt(entry.id, 16),
+        rt: entry.realtime,
+        type: entry.type,
+        path: entry.path,
+        lastSend: 0
+      }));
 
-  plugin.schema = () => ({
-    title: 'Set System Time with sudo',
-    type: 'object',
-    properties: {
-      interval: {
-        type: 'number',
-        title: 'Interval between updates in seconds (0 is once upon plugin start when datetime received)',
-        default: 0
-      },
-      sudo: {
-        type: 'boolean',
-        title: 'Use sudo when setting the time',
-        default: true
-      },
-      preferNetworkTime: {
-        type: 'boolean',
-        title: 'Set system time only if no other source are available ( Only chrony detected )',
-        default: true
-      }
-    }
-  })
+      const outputs = (options.outputs || []).map(entry => ({
+        id: parseInt(entry.id, 16),
+        rt: entry.realtime,
+        type: entry.type,
+        path: entry.path
+      }));
 
-  const SUDO_NOT_AVAILABLE = 'SUDO_NOT_AVAILABLE'
+      channel = can.createRawChannel(options.canInterface, true);
+      
+      // Mask states which bits should be set e.g. 0x400 will only match frames with MSB set
+      app.debug(`Setting up CAN channel ${options.canInterface} with filter ID ${options.filterID} and mask ${options.filterMask}`);
+      channel.setRxFilters({id: parseInt(options.filterID, 16), mask: parseInt(options.filterMask, 16)});
 
-  let count = 0
-  let lastMessage = ''
-  plugin.statusMessage = function () {
-    return `${lastMessage} ${count > 0 ? '- system time set ' + count + ' times' : ''}`
-  }
+      // Listener for incoming frames
+      channel.addListener("onMessage", function(frame) {
+        //app.debug(`Received CAN frame 0x${frame.id.toString(16)} with data: ${frame.data.toString('hex')}`);
+        const mapping = inputs.find(input => input.id === frame.id);
+        // Not configured to decode this ID
+        if (!mapping) { return; }
 
-  plugin.start = function (options) {
-    let stream = app.streambundle.getSelfStream('navigation.datetime')
-    if (options && options.interval > 0) {
-      stream = stream.debounceImmediate(options.interval * 1000)
-    } else {
-      stream = stream.take(1)
-    }
-    plugin.unsubscribes.push(
-      stream.onValue(function (datetime) {
-        var child
-        if (process.platform == 'win32') {
-          console.error("Set-system-time supports only linux-like os's")
-        } else {
-          if( ! plugin.useNetworkTime(options) ){
-            const useSudo = typeof options.sudo === 'undefined' || options.sudo
-            const setDate = `date --iso-8601 -u -s "${datetime}"`
-            const command = useSudo
-              ? `if sudo -n date &> /dev/null ; then sudo ${setDate} ; else exit 3 ; fi`
-              : setDate
-            child = require('child_process').spawn('sh', ['-c', command])
-            child.on('exit', value => {
-              if (value === 0) {
-                count++
-                lastMessage = 'System time set to ' + datetime
-                debug(lastMessage)
-              } else if (value === 3) {
-                lastMessage =
-                  'Passwordless sudo not available, can not set system time'
-                logError(lastMessage)
-              }
-            })
-            child.stderr.on('data', function (data) {
-              lastMessage = data.toString()
-              logError(lastMessage)
-            })
-          }
+        // Check if we already sent this frame recently
+        const now = Date.now();
+        if (now - mapping.lastSend < options.throttle) {
+          app.debug(`Ignoring CAN frame 0x${frame.id.toString(16)} due to throttle`);
+          return;
         }
-      })
-    )
-  }
+        mapping.lastSend = now;
 
-  plugin.useNetworkTime = (options) => {
-    if ( typeof options.preferNetworkTime !== 'undefined' && options.preferNetworkTime == true ){
-      const chronyCmd = "chronyc sources 2> /dev/null | cut -c2 | grep -ce '-\|*'";
-      try {
-        validSources = require('child_process').execSync(chronyCmd,{timeout:500});
-      } catch (e) {
-        return false
+        let value;
+        try {
+          if (mapping.type === "uint") {
+            value = frame.data.readUInt32LE(0);
+          } else if (mapping.type === "int") {
+            value = frame.data.readInt32LE(0);
+          } else if (mapping.type === "float") {
+            value = frame.data.readFloatLE(0);
+          }
+          else if (mapping.type === "xyz-float") {
+            value = {
+              x: frame.data.readFloatLE(0),
+              y: frame.data.readFloatLE(4),
+              z: frame.data.readFloatLE(8)
+            };
+          }
+        } catch (err) {
+          app.error(`Error decoding frame 0x${frame.id.toString(16)}: ${err.message}`);
+          return;
+        }
+
+        app.debug(`Decoded CAN 0x${frame.id.toString(16)} = ${value} (${mapping.type}) to ${mapping.path}`);
+
+        app.handleMessage("simple-can-gw", {
+          updates: [
+            {
+              values: [
+                {
+                  path: mapping.path,
+                  value: value
+                }
+              ]
+            }
+          ]
+        });
+      });
+      
+      outputs.forEach(output => {
+        let handler = (value) => {
+          if (typeof value === "object" && value !== null && "value" in value) {
+            value = value.value;
+          }
+          app.debug(`Encoding ${value} (${output.type}) to CAN ID 0x${output.id.toString(16)}`);
+          
+          const buffer = Buffer.alloc(8); // All zeros, can adjust size if needed
+          try {
+            if (output.type === "uint") {
+              buffer.writeUInt32LE(value, 0);
+            } else if (output.type === "int") {
+              buffer.writeInt32LE(value, 0);
+            } else if (output.type === "float") {
+              buffer.writeFloatLE(value, 0);
+            }
+          } catch (err) {
+            app.error(`Error encoding ${output.path}: ${err.message}`);
+            return;
+          }
+          
+          const frame = { id: output.id, data: buffer };
+          channel.send(frame);
+        }
+        if (output.rt) {
+          const sub = app.streambundle.getBus(output.path).onValue(handler);
+        } else {
+          const sub = app.streambundle.getBus(output.path).throttle(options.throttle).onValue(handler);
+        }
+        subList.push(sub);
+      });
+
+      channel.start();
+    },
+    stop: () => {
+      if (channel) {
+        app.debug("Stopping CAN channel");
+        channel.stop();
+        channel = null;
       }
-      if(validSources > 0 ){
-        return true
+      if (subList) {
+        subList.forEach(u => u && u());
+        subList = [];
       }
-    }
-    return false
+    },
+    schema: () => ({
+      title: "Simple CAN GW Configuration",
+      description: "Configure CAN IDs to decode incoming data and encode outgoing deltas.",
+      type: "object",
+      properties: {
+        canInterface: { type: "string", title: "CAN Interface", default: "can0" },
+        throttle: { type: "number", title: "Throttle Time (ms)", default: 5000, minimum: 1000, maximum: 60000 },
+        filterID: { type: "string", title: "CAN ID Filter", description: "Filter which CAN IDs to process", default: "0x400" },
+        filterMask: { type: "string", title: "CAN ID Mask", description: "Mask off bits in CAN ID", default: "0x400" },
+        inputs: {
+          type: "array",
+          title: "CAN ID Inputs",
+          items: {
+            type: "object",
+            required: ["id", "type", "path", "realtime"],
+            properties: {
+              id: { type: "string", title: "CAN ID (e.g. 0x123)", default: "0x123" },
+              realtime: { type: "boolean", title: "Realtime Updates", default: false },
+              type: { type: "string", title: "Data Type", enum: ["uint", "int", "float", "xyz-float"], default: "float" },
+              path: { type: "string", title: "Signal K Path to write to", default: "environment.depth.belowTransducer" }
+            }
+          },
+          default: []
+        },
+        outputs: {
+          type: "array",
+          title: "CAN ID Outputs",
+          items: {
+            type: "object",
+            required: ["id", "type", "path", "realtime"],
+            properties: {
+              id: { type: "string", title: "CAN ID (e.g. 0x400)", default: "0x400" },
+              realtime: { type: "boolean", title: "Realtime Updates", default: false },
+              type: { type: "string", title: "Data Type", enum: ["uint", "int", "float"], default: "float" },
+              path: { type: "string", title: "Signal K Path to read from", default: "environment.depth.belowTransducer" }
+            }
+          },
+          default: []
+        }
+      }
+    })
   }
-
-  plugin.stop = function () {
-    plugin.unsubscribes.forEach(f => f())
-  }
-
   return plugin
 }

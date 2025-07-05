@@ -1,21 +1,12 @@
-# set-system-time
-Signal K Node server plugin to set system time on time data from GPS
-<br>
+# signalk-simple-can-gw
+This plugin can relay between a simple CAN protocol and deltas in both directions.
+One CAN ID can hold one value e.g. uint, int, float which than gets mapped to a data field.
 
-![UI image](https://i.imgur.com/K0IZQxG.png "UI image")
-<br>
-<br>
+Same can be done the other way around.
 
-# Configuration Interface
-###  Use sudo when setting the time :
-When this option is checked, **set-system-time plugin** will try to use `sudo` to set the date. 
-It's required that sudo have a password-less access to the `date` command.
+To not overwhelm the server, filters can be set. On my bus for example all telemetric data has the CAN-ID MSB set so I filter everything else out with id = 0x400 and mask 0x400.
 
+To throttle the ingestion further the realtime flag can be ticked off so the throttle time will apply.
 
-To give `sudo` a no password access only to the `date` command, you can add the following line to your sudoers file : 
-```
-pi ALL=(ALL) NOPASSWD: /bin/date
-```
- --- *In this example, **pi** is the username that run the signalk server. Yours could be different.*
-
-Sudo is not available in Signal K Server image, but setting time should work without it with the latest Docker image.
+# Configuration
+![Configuration Page](img/config-page.png)
